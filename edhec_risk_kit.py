@@ -1,9 +1,48 @@
-########Calculate Drawdowns#########
-##Process Fama-French Returns Data##
+########Financial Calculations#############
+##Analyze Assets and Construct Portfolios##
 
 import pandas as pd
 import numpy as np
 import scipy.stats 
+from scipy.optimize import minimize
+
+def annualize_rets(r, periods_per_year):
+    """
+    Annualizes a set of returns
+    """
+    compounded_growth = (1+r).prod()
+    n_periods = r.shape[0]
+    return compounded_growth**(periods_per_year/n_periods)-1
+
+def annualize_vol(r, periods_per_year):
+    """
+    Annualizes the vol of a set of returns
+    """
+    return r.std()*(periods_per_year**0.5)
+
+def get_riskfree_rate():
+    """
+    Daily Treasury Bill Rates
+    for use in sharpe_ratio to calculate risk-adjusted perfomance
+    """
+    I10YTCMR = pd.read_csv('https://home.treasury.gov/resource-center/data-chart-center/interest-rates/daily-treasury-rates.csv/2023/all?type=daily_treasury_yield_curve&field_tdr_date_value=2023&page&_format=csv',
+                         index_col='Date', parse_dates=True)
+    proxy = I10YTCMR['10 Yr'][0]
+    print(proxy)
+    return proxy
+
+def sharpe_ratio(r, periods_per_year):
+    """
+    Computes the annualized sharpe ratio of a set of returns
+    Changes arg. riskfree_rate to find based on treasury data
+    """
+    # convert the annual riskfree rate to per period
+    riskfree_rate = get_riskfree_rate()/100
+    rf_per_period = (1+riskfree_rate)**(1/periods_per_year)-1
+    excess_ret = r - rf_per_period
+    ann_ex_ret = annualize_rets(excess_ret, periods_per_year)
+    ann_vol = annualize_vol(r, periods_per_year)
+    return ann_ex_ret/ann_vol
 
 def drawdown(return_series: pd.Series): # pd.Series optional # input = series, output = drawdown
     """
@@ -52,6 +91,19 @@ def get_hfi_returns():
     ## need hfi.index.to_period()
     hfi.index = hfi.index.to_period('M')
     return hfi
+
+def get_ind_returns():
+    """
+    Load and format Ken French 30 Industry Portfolios Value Weighted Monthly Returns
+    """
+    path = r'C:\Users\breta\OneDrive\Desktop\Workspace\EDHEC\ind30_m_vw_rets.csv'
+    # set date column as index, header in row 0, convert from %
+    ind = pd.read_csv(path, header=0, index_col=0)/100
+    # date is as if int, parse does not work, convert to datetime YYYY-MM-01 --> to period M --> YYYY-MM
+    ind.index = pd.to_datetime(ind.index, format="%Y%m").to_period('M')
+    # clean whitespace, prevent indexing issues ['Food ']
+    ind.columns = ind.columns.str.strip()
+    return ind
 
 def skewness(r): 
     """
@@ -183,3 +235,94 @@ def cvar_historic(r, level=5):
         return r.aggregate(cvar_historic, level=level)
     else:
         raise TypeError("Expected r to be a Series or DataFrame")
+
+def portfolio_return(weights, returns): 
+    """
+    Computes the return on a portfolio from constituent returns and weights
+    weights are a numpy array or Nx1 matrix and returns are a numpy array or Nx1 matrix
+    """
+    return weights.T @ returns
+
+def portfolio_vol(weights, covmat):
+    """
+    Computes the vol of a portfolio from a covariance matrix and constituent weights
+    weights are a numpy array or N x 1 maxtrix and covmat is an N x N matrix
+    """
+    return (weights.T @ covmat @ weights)**0.5
+
+def plot_ef2(n_points, er, cov, style=".-"):
+    """
+    Plots the 2-assets, efficient frontier
+    args: with 2 asset list l
+    n_points n points/portfolios to generate
+    er expected returns er[l]
+    cov covariance matrix covariance cov.loc[l,l]
+    style default is dot dash for markers on line
+    """
+    if er.shape[0] != 2 or er.shape[0] != 2:
+        raise ValueError("plot_ef2 can only plot 2-asset frontiers")
+    weights = [np.array([w, 1-w]) for w in np.linspace(0, 1, n_points)]
+    rets = [portfolio_return(w, er) for w in weights]
+    vols = [portfolio_vol(w, cov) for w in weights]
+    ef = pd.DataFrame({
+        "Returns": rets, 
+        "Volatility": vols
+    })
+    return ef.plot.line(x="Volatility", y="Returns", style=style) 
+
+def minimize_vol(target_return, er, cov):
+    """
+    Target return -> Optimal weight vector that acheive target return
+    given a set of returns (er), and a covariance matrix (cov)
+    """
+    # number of assets = number of portfolio options
+    n = er.shape[0]
+    # initial guess for optimizer, 50:50
+    init_guess = np.repeat(1/n, n)
+    # constraints, bounds for optimizer, a sequence of bounds for every weight
+    ## desire balanced weights, not >1 equivalent leverage, not neg. going short 
+    ### -> min 0 max 1 for every n asset (n copys of tuple in tuple)
+    bounds = ((0.0, 1),)*n
+    ## ensure return satisfies target return, function fun should = 0 'eq'
+    return_is_target = {
+        'type': 'eq',
+        'args': (er,),
+        'fun': lambda weights, er: target_return - portfolio_return(weights, er)
+    }
+    ## weights sum to 1
+    weights_sum_to_1 = {
+        'type': 'eq',
+        'fun': lambda weights: np.sum(weights) - 1
+    }
+    # optimizer
+    weights = minimize(portfolio_vol, init_guess,
+                       args=(cov,), method='SLSQP',
+                       options={'disp': False},
+                       constraints=(return_is_target, weights_sum_to_1),
+                       bounds=bounds)
+    return weights.x
+
+def optimal_weights(n_points, er, cov):
+    """
+    generates a list of weights to run the optimizer on to minimize the volatility
+    """
+    # set of target returns
+    target_rs = np.linspace(er.min(), er.max(), n_points)
+    # series of weights from series of returns from optimizer
+    weights = [minimize_vol(target_return, er, cov) for target_return in target_rs]
+    return weights
+
+def plot_ef(n_points, er, cov, style=".-"):
+    """
+    Plots the multi-asset efficient frontier
+    """
+    # weights: finding the portfolio that minimizes volatility for a certain target return
+    weights = optimal_weights(n_points, er, cov) # quadratic optimizer
+    # rets, vols: same for n and 2 portfolios
+    rets = [portfolio_return(w, er) for w in weights]
+    vols = [portfolio_vol(w, cov) for w in weights]
+    ef = pd.DataFrame({
+        "Returns": rets, 
+        "Volatility": vols
+    })
+    return ef.plot.line(x="Volatility", y="Returns", style=style)
