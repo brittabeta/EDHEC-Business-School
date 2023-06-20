@@ -28,7 +28,6 @@ def get_riskfree_rate():
     I10YTCMR = pd.read_csv('https://home.treasury.gov/resource-center/data-chart-center/interest-rates/daily-treasury-rates.csv/2023/all?type=daily_treasury_yield_curve&field_tdr_date_value=2023&page&_format=csv',
                          index_col='Date', parse_dates=True)
     proxy = I10YTCMR['10 Yr'][0]
-    print(proxy)
     return proxy
 
 def sharpe_ratio(r, periods_per_year):
@@ -312,9 +311,21 @@ def optimal_weights(n_points, er, cov):
     weights = [minimize_vol(target_return, er, cov) for target_return in target_rs]
     return weights
 
-def plot_ef(n_points, er, cov, style=".-"):
+def gmv(cov):
+    """
+    Returns the weight of the Global Minimum Volatility portfolio
+    given the covariance matrix
+    """
+    n = cov.shape[0] # risk free rate of 0 does not matter
+    return msr(riskfree_rate=0, er=np.repeat(1, n), cov=cov)
+
+def plot_ef(n_points, er, cov, show_cml=False, style=".-", riskfree_rate=0, show_ew=False, show_gmv=False):
     """
     Plots the multi-asset efficient frontier
+    Plots CML if show_cml = True
+    Plots EW if show_ew = True
+    Plots GMV if show_gmv = True
+    For riskfree_rate use get_riskfree_rate() / 100
     """
     # weights: finding the portfolio that minimizes volatility for a certain target return
     weights = optimal_weights(n_points, er, cov) # quadratic optimizer
@@ -325,4 +336,62 @@ def plot_ef(n_points, er, cov, style=".-"):
         "Returns": rets, 
         "Volatility": vols
     })
-    return ef.plot.line(x="Volatility", y="Returns", style=style)
+    ax = ef.plot.line(x="Volatility", y="Returns", style=style)
+    if show_gmv:
+        w_gmv = gmv(cov)
+        r_gmv = portfolio_return(weights=w_gmv, returns=er)
+        vol_gmv = portfolio_vol(weights=w_gmv, covmat=cov)
+        # display GMV, x axis vol, y axis rets
+        ax.plot([vol_gmv], [r_gmv], color='violet', marker='*', markersize=10)
+    if show_ew:
+        n = er.shape[0]
+        w_ew = np.repeat(1/n, n)
+        r_ew = portfolio_return(weights=w_ew, returns=er)
+        vol_ew = portfolio_vol(weights=w_ew, covmat=cov)
+        # display EW, x axis vol, y axis rets
+        ax.plot([vol_ew], [r_ew], color='goldenrod', marker='o', markersize=10)
+    if show_cml:
+        ax.set_xlim(left=0)
+        # risk-free rate default 0.0377 
+        rf = 0.0377
+        w_msr = msr(riskfree_rate=rf, er=er, cov=cov) # weights of msr
+        r_msr = portfolio_return(weights=w_msr, returns=er) # returns of msr
+        vol_msr = portfolio_vol(weights=w_msr, covmat=cov) # vol of msr
+        # capital market line
+        cml_x = [0, vol_msr] 
+        cml_y = [riskfree_rate, r_msr] 
+        ax.plot(cml_x, cml_y, color='green', marker="o", linestyle='dashed', markersize=12, linewidth=2)
+
+    return ax
+
+def msr(riskfree_rate, er, cov):
+    """
+    Optimal weight vector that acheive target return
+    given a set of returns (er), a covariance matrix (cov),
+    and a risk-free rate, use get_riskfree_rate() / 100
+    Caution: inaccurate estimated returns = very inaccurate allocations
+    """
+    n = er.shape[0]
+    init_guess = np.repeat(1/n, n)
+    bounds = ((0.0, 1),)*n
+    weights_sum_to_1 = {
+        'type': 'eq',
+        'fun': lambda weights: np.sum(weights) - 1
+    }
+    # optimizer
+    # define objective function
+    def neg_sharpe_ratio(weights, riskfree_rate, er, cov):
+        """
+        Returns the negative of the sharpe ratio given weights
+        """
+        r = portfolio_return(weights, er) # the return
+        vol = portfolio_vol(weights, cov) # volatility
+        # excess return = r - riskfree_rate
+        return -(r - riskfree_rate) / vol
+    
+    results = minimize(neg_sharpe_ratio, init_guess,
+                       args=(riskfree_rate, er, cov,), method='SLSQP',
+                       options={'disp': False},
+                       constraints=(weights_sum_to_1,),
+                       bounds=bounds)
+    return results.x
